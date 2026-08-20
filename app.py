@@ -123,7 +123,6 @@ def classify_intent(user_message):
             res_data = json.loads(response.read().decode('utf-8'))
             content = res_data['choices'][0]['message']['content']
             
-            # 텍스트 파싱 오류를 방지하기 위한 간접 치환 (문자열 곱셈 연산 사용)
             backticks = "`" * 3
             clean_content = content.replace(backticks + "json", "").replace(backticks, "").strip()
             
@@ -313,9 +312,6 @@ def inject_custom_css():
         border-bottom: 2px solid #E5E5E5;
         margin-bottom: 20px;
     }
-    .custom-header img {
-        height: 35px;
-    }
     .custom-header h1 {
         margin: 0;
         font-size: 24px;
@@ -341,7 +337,7 @@ def main():
     
     st.markdown('''
     <div class="custom-header">
-        <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/c/c5/KB_Kookmin_Bank_logo.svg/1280px-KB_Kookmin_Bank_logo.svg.png" alt="KB Logo">
+        <span style="color: #FFCC00; font-size: 28px; font-weight: 900; letter-spacing: -1px;">KB Kookmin Bank</span>
         <h1>AI Assistant Prototype <span style="color:#F97316; font-size:16px;">Powered by Mistral</span></h1>
     </div>
     ''', unsafe_allow_html=True)
@@ -354,7 +350,9 @@ def main():
         chat_container = st.container(height=600)
         with chat_container:
             for msg in st.session_state.chat_history:
-                st.chat_message(msg["role"]).write(msg["content"])
+                # Assistant 메시지일 경우 제공된 Mistral 로고 적용
+                avatar_img = "Mistral-Icon-Gradient-RGB.png" if msg["role"] == "assistant" else None
+                st.chat_message(msg["role"], avatar=avatar_img).write(msg["content"])
 
         user_input = st.chat_input("Enter request here...")
         if user_input:
@@ -364,7 +362,7 @@ def main():
             st.rerun()
 
     with col_trace:
-        st.subheader("System of Record")
+        st.subheader("Status")
         auth_indicator = "✅ VERIFIED" if st.session_state.authenticated else "❌ UNVERIFIED"
         
         col_sys1, col_sys2, col_sys3 = st.columns(3)
