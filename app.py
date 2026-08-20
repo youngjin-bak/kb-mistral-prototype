@@ -86,60 +86,82 @@ def retrieve_knowledge(branch, attribute):
 # ==========================================
 # 4. Probabilistic AI Layer (Mistral REST API)
 # ==========================================
-def classify_intent(user_message):
-    api_key = os.environ.get("MISTRAL_API_KEY", "")
-    if not api_key: return {"intent": "UNKNOWN", "parameters": {}}
-        
+def _call_mistral_json(model, system_prompt, user_message, api_key):
     url = "https://api.mistral.ai/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Authorization": f"Bearer {api_key}"
     }
-    
     payload = {
-        "model": "mistral-small-latest",
+        "model": model,
         "messages": [
-            {
-                "role": "system",
-                "content": """
-                Classify the request into one category: FAQ, BALANCE, CARD_LOCK, CARD_UNLOCK, TRANSFER, UNKNOWN.
-                
-                - For FAQ: Extract 'branch' and 'attribute'. The 'attribute' MUST be mapped to exactly one of: 'hours' (for open/close time), 'phone', or 'loan_officer'.
-                - For TRANSFER: Extract 'target_bank', 'target_account', and 'amount'. If any of these are missing in the user's input, omit the key entirely. Do not use placeholders (e.g., 'unknown', 'N/A').
-                
-                You MUST return ONLY a valid JSON object with EXACTLY these two keys: "intent" and "parameters".
-                Example: {"intent": "FAQ", "parameters": {"branch": "Gangnam", "attribute": "hours"}}
-                """
-            },
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
         ],
         "response_format": {"type": "json_object"}
     }
-    
     try:
         req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
         with urllib.request.urlopen(req) as response:
             res_data = json.loads(response.read().decode('utf-8'))
             content = res_data['choices'][0]['message']['content']
-            
             backticks = "`" * 3
             clean_content = content.replace(backticks + "json", "").replace(backticks, "").strip()
-            
-            result = json.loads(clean_content)
-            
-            intent = result.get("intent", "UNKNOWN")
-            parameters = result.get("parameters", {})
-            
-            VALID_INTENTS = ["FAQ", "BALANCE", "CARD_LOCK", "CARD_UNLOCK", "TRANSFER", "UNKNOWN"]
-            if intent not in VALID_INTENTS:
-                return {"intent": "UNKNOWN", "parameters": {}}
-                
-            return {"intent": intent, "parameters": parameters}
+            return json.loads(clean_content)
     except Exception as e:
-        print(f"Mistral API Error: {e}")
-        return {"intent": "UNKNOWN", "parameters": {}}
+        print(f"Mistral API Error ({model}): {e}")
+        return {}
 
+def classify_intent(user_message):
+    api_key = os.environ.get("MISTRAL_API_KEY", "")
+    if not api_key: return {"intent": "UNKNOWN", "parameters": {}}
+        
+    # STAGE 1: MACRO-ROUTING (Mistral Small)
+    small_prompt = """
+    Classify the request into exactly one category: FAQ, BALANCE, CARD_LOCK, CARD_UNLOCK, TRANSFER, UNKNOWN.
+    You MUST return ONLY a valid JSON object with EXACTLY one key: "intent".
+    Example: {"intent": "TRANSFER"}
+    """
+    
+    stage_1_result = _call_mistral_json("mistral-small-latest", small_prompt, user_message, api_key)
+    intent = stage_1_result.get("intent", "UNKNOWN")
+    
+    VALID_INTENTS = ["FAQ", "BALANCE", "CARD_LOCK", "CARD_UNLOCK", "TRANSFER", "UNKNOWN"]
+    if intent not in VALID_INTENTS:
+        intent = "UNKNOWN"
+
+    add_trace("🤖 Macro-Routing (Mistral Small)", f"Classified intent as: {intent}")
+
+    # STAGE 2: MICRO-ROUTING & EXTRACTION (Cascading based on complexity)
+    parameters = {}
+    if intent == "TRANSFER":
+        # Complex task: Route to SMoE (Mixtral)
+        smoe_prompt = f"""
+        The user wants to execute a {intent}. 
+        Extract 'target_bank', 'target_account', and 'amount'. If missing, omit the key. Do not use placeholders.
+        You MUST return ONLY a valid JSON object with the key: "parameters".
+        Example: {{"parameters": {{"target_bank": "Hana", "amount": "50000"}}}}
+        """
+        stage_2_result = _call_mistral_json("open-mixtral-8x22b", smoe_prompt, user_message, api_key)
+        parameters = stage_2_result.get("parameters", {})
+        add_trace("🧠 Micro-Routing (SMoE: Mixtral 8x22b)", f"High-precision slot extraction: {parameters}")
+        
+    elif intent == "FAQ":
+        # Simple task: Keep on Mistral Small
+        faq_prompt = f"""
+        The user wants a {intent}. 
+        Extract 'branch' and 'attribute'. 'attribute' MUST be 'hours', 'phone', or 'loan_officer'.
+        You MUST return ONLY a valid JSON object with the key: "parameters".
+        """
+        stage_2_result = _call_mistral_json("mistral-small-latest", faq_prompt, user_message, api_key)
+        parameters = stage_2_result.get("parameters", {})
+        
+        formatted_params = json.dumps(parameters, ensure_ascii=False)
+        add_trace("🤖 Extraction (Mistral Small)", f"Simple slot extraction: {formatted_params}")
+
+    return {"intent": intent, "parameters": parameters}
+    
 # ==========================================
 # 5. Deterministic Orchestrator (State Machine)
 # ==========================================
@@ -147,31 +169,7 @@ def handle_request(message):
     st.session_state.last_trace = [] 
     
     if st.session_state.awaiting_input_for == "auth":
-        if st.session_state.auth_target_name in message.lower():
-            st.session_state.authenticated = True
-            st.session_state.awaiting_input_for = None
-            add_trace("🔐 Auth Engine", "Identity verified successfully.")
-            return process_active_intent()
-        else:
-            add_trace("🔐 Auth Engine", f"Verification failed for input: {message}")
-            return "Authentication failed. Please enter your registered full name to proceed."
-
-    if st.session_state.awaiting_input_for == "target_bank":
-        st.session_state.collected_params["target_bank"] = message
-        st.session_state.awaiting_input_for = None
-        add_trace("📥 Slot Filling", f"Captured Target Bank: {message}")
-        return process_active_intent()
-
-    if st.session_state.awaiting_input_for == "target_account":
-        st.session_state.collected_params["target_account"] = message
-        st.session_state.awaiting_input_for = None
-        add_trace("📥 Slot Filling", f"Captured Target Account: {message}")
-        return process_active_intent()
-
-    if st.session_state.awaiting_input_for == "amount":
-        st.session_state.collected_params["amount"] = message
-        st.session_state.awaiting_input_for = None
-        add_trace("📥 Slot Filling", f"Captured Amount: {message}")
+# ... existing code ...
         return process_active_intent()
 
     nlu_result = classify_intent(message)
@@ -180,7 +178,7 @@ def handle_request(message):
     if intent != "UNKNOWN":
         st.session_state.active_intent = intent
         st.session_state.collected_params = nlu_result["parameters"]
-        add_trace("🤖 Mistral NLU", f"Extracted Intent: {intent}")
+        # The add_trace for Mistral NLU was moved into classify_intent to show the cascading steps.
     else:
         add_trace("🤖 Mistral NLU", "Failed to classify intent.")
         return "I couldn't understand your request. Please try again."
