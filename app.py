@@ -123,4 +123,20 @@ def classify_intent(user_message):
             res_data = json.loads(response.read().decode('utf-8'))
             content = res_data['choices'][0]['message']['content']
             
-            clean_content = content.replace("```json", "").replace("
+            # 마크다운 텍스트 파싱 오류를 방지하기 위해 백틱을 간접 생성하여 치환합니다.
+            backticks = "`" * 3
+            clean_content = content.replace(backticks + "json", "").replace(backticks, "").strip()
+            
+            result = json.loads(clean_content)
+            
+            intent = result.get("intent", "UNKNOWN")
+            parameters = result.get("parameters", {})
+            
+            VALID_INTENTS = ["FAQ", "BALANCE", "CARD_LOCK", "CARD_UNLOCK", "TRANSFER", "UNKNOWN"]
+            if intent not in VALID_INTENTS:
+                return {"intent": "UNKNOWN", "parameters": {}}
+                
+            return {"intent": intent, "parameters": parameters}
+    except Exception as e:
+        print(f"Mistral API Error: {e}")
+        return {"intent": "UNKNOWN", "parameters": {}}
