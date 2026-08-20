@@ -94,10 +94,11 @@ def classify_intent(user_message):
                 "content": """
                 Classify the request into one category: FAQ, BALANCE, CARD_LOCK, CARD_UNLOCK, TRANSFER, UNKNOWN.
                 
-                - For FAQ: Map the user's intent to one 'attribute' (must be exactly 'hours', 'phone', or 'loan_officer') and extract the 'branch'.
+                - For FAQ: Extract 'branch' and 'attribute'. The 'attribute' MUST be mapped to exactly one of: 'hours' (for open/close time), 'phone', or 'loan_officer'.
                 - For TRANSFER: Extract 'target_bank', 'target_account', and 'amount'. If any of these are missing in the user's input, omit the key entirely. Do not use placeholders (e.g., 'unknown', 'N/A').
                 
-                Return ONLY valid JSON.
+                You MUST return ONLY a valid JSON object with EXACTLY these two keys: "intent" and "parameters".
+                Example: {"intent": "FAQ", "parameters": {"branch": "Gangnam", "attribute": "hours"}}
                 """
             },
             {"role": "user", "content": user_message}
