@@ -93,9 +93,10 @@ def classify_intent(user_message):
                 "role": "system",
                 "content": """
                 Classify the request into one category: FAQ, BALANCE, CARD_LOCK, CARD_UNLOCK, TRANSFER, UNKNOWN.
-                If FAQ, extract 'branch' and 'attribute'. The 'attribute' MUST be 'hours', 'phone', or 'loan_officer'.
-                If TRANSFER, extract 'target_bank', 'target_account', and 'amount'.
-                CRITICAL INSTRUCTION: If a parameter is not explicitly provided by the user, omit the key entirely. DO NOT use placeholders like 'unknown', 'N/A', or null.
+                
+                - For FAQ: Map the user's intent to one 'attribute' (must be exactly 'hours', 'phone', or 'loan_officer') and extract the 'branch'.
+                - For TRANSFER: Extract 'target_bank', 'target_account', and 'amount'. If any of these are missing in the user's input, omit the key entirely. Do not use placeholders (e.g., 'unknown', 'N/A').
+                
                 Return ONLY valid JSON.
                 """
             },
@@ -113,8 +114,13 @@ def classify_intent(user_message):
             
             intent = result.get("intent", "UNKNOWN")
             parameters = result.get("parameters", {})
+            
+            VALID_INTENTS = ["FAQ", "BALANCE", "CARD_LOCK", "CARD_UNLOCK", "TRANSFER", "UNKNOWN"]
+            if intent not in VALID_INTENTS:
+                return {"intent": "UNKNOWN", "parameters": {}}
+                
             return {"intent": intent, "parameters": parameters}
-    except Exception:
+    except Exception as e:
         return {"intent": "UNKNOWN", "parameters": {}}
 
 # ==========================================
