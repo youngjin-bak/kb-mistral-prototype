@@ -69,11 +69,13 @@ MOCK_KNOWLEDGE_BASE = {
     "Gangnam": {
         "hours": "9 AM to 4 PM, Mon-Fri",
         "phone": "02-123-4567",
-        "loan_officer": "John Doe (john@kb.com)"
+        "loan_officer": "John Doe (john@kb.com)",
+        "address": "123 Teheran-ro, Gangnam-gu, Seoul"
     },
     "Jongno": {
         "hours": "9 AM to 4 PM, Mon-Fri",
-        "phone": "02-987-6543"
+        "phone": "02-987-6543",
+        "address": "45 Jong-ro, Jongno-gu, Seoul"
     }
 }
 
@@ -112,6 +114,48 @@ def _call_mistral_json(model, system_prompt, user_message, api_key):
     except Exception as e:
         print(f"Mistral API Error ({model}): {e}")
         return {}
+
+def _call_mistral_text(model, system_prompt, user_message, api_key):
+    """Helper for generating plain natural language (non-JSON) conversational responses."""
+    url = "https://api.mistral.ai/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+    }
+    try:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+        with urllib.request.urlopen(req) as response:
+            res_data = json.loads(response.read().decode('utf-8'))
+            return res_data['choices'][0]['message']['content'].strip()
+    except Exception as e:
+        return ""
+
+def generate_fallback(user_message):
+    """Generates an empathetic acknowledgment before handing off to a human."""
+    api_key = os.environ.get("MISTRAL_API_KEY", "")
+    if not api_key:
+        return "I apologize, but I currently do not have the information or authority to support your inquiry. Let me connect the human agent to answer it."
+    
+    system_prompt = """
+    You are a polite, welcoming customer service agent for KB Kookmin Bank.
+    Acknowledge the user's inquiry empathetically in exactly ONE short sentence. 
+    Do NOT provide any factual answers or promise solutions. Just acknowledge what they asked.
+    Example: "I understand you are looking for information about our international wire transfer fees."
+    """
+    
+    prefix = _call_mistral_text("mistral-small-latest", system_prompt, user_message, api_key)
+    if not prefix:
+        prefix = "I understand your request."
+        
+    return f"{prefix} However, I currently do not have the information or authority to support your inquiry - let me connect the human agent to answer it."
 
 def classify_intent(user_message):
     api_key = os.environ.get("MISTRAL_API_KEY", "")
@@ -154,7 +198,7 @@ def classify_intent(user_message):
         # Simple task: Keep on Mistral Small
         faq_prompt = f"""
         The user wants a {intent}. 
-        Extract 'branch' and 'attribute'. 'attribute' MUST be 'hours', 'phone', or 'loan_officer'.
+        Extract 'branch' and 'attribute' (e.g., 'hours', 'phone', 'address', 'loan_officer'). 
         You MUST return ONLY a valid JSON object with the key: "parameters".
         """
         stage_2_result = _call_mistral_json("mistral-small-latest", faq_prompt, user_message, api_key)
@@ -179,7 +223,7 @@ def handle_request(message):
             st.session_state.authenticated = True
             st.session_state.awaiting_input_for = None
             add_trace("🔐 Auth Engine", "Identity verified successfully.")
-            return process_active_intent()
+            return process_active_intent(message)
         else:
             add_trace("🔐 Auth Engine", "Identity verification failed.")
             return "Name does not match our records. Please enter your full name to verify your identity."
@@ -188,7 +232,7 @@ def handle_request(message):
         st.session_state.collected_params[pending_slot] = message
         st.session_state.awaiting_input_for = None
         add_trace("⚠️ Validation", f"User provided missing slot: {pending_slot}")
-        return process_active_intent()
+        return process_active_intent(message)
 
     # If no pending slot, classify the new intent
     nlu_result = classify_intent(message)
@@ -198,12 +242,16 @@ def handle_request(message):
         st.session_state.active_intent = intent
         st.session_state.collected_params = nlu_result["parameters"]
     else:
-        add_trace("🤖 Mistral NLU", "Failed to classify intent.")
-        return "I couldn't understand your request. Please try again."
+        add_trace("🤖 Mistral NLU", "Intent UNKNOWN. Generating empathetic fallback.")
+        st.session_state.pending_action = {
+            "intent": "UNKNOWN_HANDOFF",
+            "status": "PENDING"
+        }
+        return generate_fallback(message)
 
-    return process_active_intent()
+    return process_active_intent(message)
 
-def process_active_intent():
+def process_active_intent(message=None):
     intent = st.session_state.active_intent
     params = st.session_state.collected_params
 
@@ -261,6 +309,11 @@ def process_active_intent():
             "attribute": attribute,
             "status": "PENDING"
         }
+        
+        if message:
+            add_trace("🤖 Mistral NLU", "Data missing. Generating empathetic fallback.")
+            return generate_fallback(message)
+            
         return "I don't have that specific information. Transferring to a human operator."
         
     elif decision == "READ_ONLY":
@@ -363,7 +416,7 @@ def main():
     with col_chat:
         st.subheader("Customer Chat")
         
-        chat_container = st.container(height=600)
+        chat_container = st.container(height=400)
         with chat_container:
             for msg in st.session_state.chat_history:
                 # Assistant 메시지일 경우 제공된 Mistral 로고 적용
@@ -395,12 +448,15 @@ def main():
         if st.session_state.pending_action and st.session_state.pending_action["status"] == "PENDING":
             action = st.session_state.pending_action
             
-            if action.get("intent") == "FAQ_MISSING_DATA":
+            if action.get("intent") in ["FAQ_MISSING_DATA", "UNKNOWN_HANDOFF"]:
                 st.warning("⚠️ Operator Input Required")
-                st.write(f"**Requested Branch:** {action.get('branch')}")
-                st.write(f"**Requested Attribute:** {action.get('attribute')}")
+                if action.get("intent") == "FAQ_MISSING_DATA":
+                    st.write(f"**Requested Branch:** {action.get('branch')}")
+                    st.write(f"**Requested Attribute:** {action.get('attribute')}")
+                else:
+                    st.write("**Reason:** Unrecognized Intent / Out of Scope")
                 
-                operator_response = st.text_input("Enter the answer to send:")
+                operator_response = st.text_input("Enter the answer to send:", key="op_fallback_input")
                 if st.button("📤 Send to Customer"):
                     if operator_response:
                         add_trace("👤 Operator", "Provided manual response")
