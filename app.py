@@ -7,7 +7,6 @@ import urllib.request
 # 1. Mock State & Authentication Setup
 # ==========================================
 def init_state():
-    # Authentication & Session States added
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
         st.session_state.auth_target_name = "youngjin bak" 
@@ -42,7 +41,6 @@ def api_unlock_card(card_id):
 # 3. Governance Layer (Policy Engine & Knowledge Base)
 # ==========================================
 def evaluate_policy(intent):
-    # Enforce Authentication Boundary
     if not st.session_state.authenticated and intent != "FAQ":
         return "AUTH_REQUIRED"
 
@@ -94,10 +92,10 @@ def classify_intent(user_message):
                 "role": "system",
                 "content": """
                 Classify the request into one category: FAQ, BALANCE, CARD_LOCK, CARD_UNLOCK, TRANSFER, UNKNOWN.
-                If FAQ, extract 'branch' and 'attribute' (e.g., hours, phone, loan_officer).
-                If TRANSFER, extract 'target_account' and 'amount'.
+                If FAQ, extract 'branch' and 'attribute'.
+                If TRANSFER, extract 'target_bank', 'target_account', and 'amount'.
                 Return ONLY valid JSON.
-                Example: {"intent": "CARD_UNLOCK", "parameters": {}}
+                Example: {"intent": "TRANSFER", "parameters": {"target_bank": "Shinhan", "target_account": "123-456", "amount": "50000"}}
                 """
             },
             {"role": "user", "content": user_message}
@@ -135,7 +133,13 @@ def handle_request(message):
             add_trace("🔐 Auth Engine", f"Verification failed for input: {message}")
             return "Authentication failed. Please enter your registered full name to proceed."
 
-    # 2. State Interception for Slot Filling (Missing Parameters)
+    # 2. State Interception for Slot Filling (TRANSFER Sequence)
+    if st.session_state.awaiting_input_for == "target_bank":
+        st.session_state.collected_params["target_bank"] = message
+        st.session_state.awaiting_input_for = None
+        add_trace("📥 Slot Filling", f"Captured Target Bank: {message}")
+        return process_active_intent()
+
     if st.session_state.awaiting_input_for == "target_account":
         st.session_state.collected_params["target_account"] = message
         st.session_state.awaiting_input_for = None
@@ -166,7 +170,6 @@ def process_active_intent():
     intent = st.session_state.active_intent
     params = st.session_state.collected_params
 
-    # 1. Evaluate Policy (Checks Auth implicitly)
     decision = evaluate_policy(intent)
     add_trace("⚖️ Policy Engine", f"Decision: {decision}")
 
@@ -175,18 +178,21 @@ def process_active_intent():
         add_trace("🔐 Auth Engine", "Halted workflow. Requesting Identity Verification.")
         return "For your security, please verify your identity by entering your full name."
 
-    # 2. Validate Required Parameters
+    # Validate Required Parameters for TRANSFER (3-step sequence)
     if intent == "TRANSFER":
+        if not params.get("target_bank"):
+            st.session_state.awaiting_input_for = "target_bank"
+            add_trace("⚠️ Validation", "Missing target_bank.")
+            return "Please enter the name of the receiving bank."
         if not params.get("target_account"):
             st.session_state.awaiting_input_for = "target_account"
-            add_trace("⚠️ Validation Engine", "Missing target_account. Prompting user.")
+            add_trace("⚠️ Validation", "Missing target_account.")
             return "Please enter the target account number."
         if not params.get("amount"):
             st.session_state.awaiting_input_for = "amount"
-            add_trace("⚠️ Validation Engine", "Missing amount. Prompting user.")
+            add_trace("⚠️ Validation", "Missing amount.")
             return "Please enter the amount you wish to transfer."
 
-    # 3. Execute Validated Intent
     if decision == "NO_TRANSACTION":
         add_trace("🔄 Orchestrator", "Routed to Knowledge Tool")
         branch = params.get("branch", "")
@@ -216,18 +222,20 @@ def process_active_intent():
             "TRANSFER": "TRANSFER"
         }
         
+        target_display = f"{params.get('target_bank')} {params.get('target_account')}" if intent == "TRANSFER" else "****1234"
+        
         st.session_state.pending_action = {
             "intent": intent,
             "action": action_map.get(intent),
             "internal_id": "CARD001" if "CARD" in intent else params.get("target_account"),
-            "display_target": "****1234" if "CARD" in intent else params.get("target_account"),
+            "display_target": target_display,
             "status": "PENDING",
             "human_summary": f"Customer requested a {intent} transaction.",
             "verification_rule": f"Identity verified: {st.session_state.authenticated}",
             "amount": params.get("amount", "N/A")
         }
         add_trace("⏳ Orchestrator", "Halted workflow for Human Approval")
-        return "Final approval from an authorized agent is required. Please review the details."
+        return "Final approval from an authorized agent is required. Please wait while an operator reviews your request."
 
 def execute_pending_action():
     action = st.session_state.pending_action
@@ -260,17 +268,20 @@ def main():
     with col_chat:
         st.subheader("Customer Chat")
         
-        for msg in st.session_state.chat_history:
-            st.chat_message(msg["role"]).write(msg["content"])
+        # UI Modification 1: Scrollable Chat Container (height fixed to 600px)
+        chat_container = st.container(height=600)
+        with chat_container:
+            for msg in st.session_state.chat_history:
+                st.chat_message(msg["role"]).write(msg["content"])
 
         user_input = st.chat_input("Enter request here...")
         if user_input:
-            st.chat_message("user").write(user_input)
+            # Append user message
             st.session_state.chat_history.append({"role": "user", "content": user_input})
             
+            # Since chat input doesn't rerun the whole script implicitly in the container block in the same way,
+            # we run handle_request and append assistant response before the st.rerun()
             response = handle_request(user_input)
-            
-            st.chat_message("assistant").write(response)
             st.session_state.chat_history.append({"role": "assistant", "content": response})
             st.rerun()
 
@@ -313,21 +324,34 @@ def main():
                 if action.get("amount") != "N/A":
                     st.write(f"**Amount:** {action.get('amount')}")
                 
+                # UI Modification 3: Operator Note and Chat Feedback
+                operator_note = st.text_input("Operator Note (Optional):", key="op_note_input")
+                
                 btn_col1, btn_col2 = st.columns(2)
                 if btn_col1.button("✅ Approve"):
                     add_trace("👤 Human Approval", "APPROVED")
                     execute_pending_action() 
+                    
+                    sys_msg = "Transaction approved and executed by human operator."
+                    if operator_note: sys_msg += f" Operator message: '{operator_note}'"
+                    st.session_state.chat_history.append({"role": "assistant", "content": f"[System] {sys_msg}"})
+                    
                     st.session_state.pending_action["status"] = "EXECUTED"
                     st.session_state.active_intent = None
                     st.session_state.collected_params = {}
-                    st.success("Transaction Complete.")
                     st.rerun()
                     
                 if btn_col2.button("❌ Reject"):
+                    add_trace("👤 Human Approval", "REJECTED")
+                    
+                    sys_msg = "Transaction request denied by human operator."
+                    if operator_note: sys_msg += f" Operator message: '{operator_note}'"
+                    else: sys_msg += " Please verify your details to proceed."
+                    st.session_state.chat_history.append({"role": "assistant", "content": f"[System] {sys_msg}"})
+                    
                     st.session_state.pending_action = None
                     st.session_state.active_intent = None
                     st.session_state.collected_params = {}
-                    st.error("Transaction cancelled.")
                     st.rerun()
 
 if __name__ == "__main__":
