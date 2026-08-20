@@ -192,29 +192,37 @@ def process_active_intent():
         add_trace("🔐 Auth Engine", "Halted workflow. Requesting Identity Verification.")
         return "For your security, please verify your identity by entering your full name."
 
-    # Helper function to detect LLM hallucinations/placeholders
-    def is_missing(val):
+        # 1. Null 값 및 형식 검증을 강화한 통합 함수
+    def is_invalid_param(val, param_type="text"):
         if not val: return True
-        if str(val).strip().lower() in ["unknown", "n/a", "none", "null", ""]: return True
+        val_str = str(val).strip().lower()
+        if val_str in ["unknown", "n/a", "none", "null", ""]: return True
+        
+        # 2. 계좌번호 포맷 엄격 검증: 하이픈/공백 제외 오직 숫자로만 구성되어야 함
+        if param_type == "account":
+            clean_account = val_str.replace("-", "").replace(" ", "")
+            if not clean_account.isdigit():
+                return True
         return False
 
-    # Validate Required Parameters for TRANSFER (3-step sequence)
+    # 3. 강화된 검증 로직 적용
     if intent == "TRANSFER":
-        if is_missing(params.get("target_bank")):
+        if is_invalid_param(params.get("target_bank"), "text"):
             st.session_state.awaiting_input_for = "target_bank"
-            add_trace("⚠️ Validation", "Missing target_bank.")
+            add_trace("⚠️ Validation", "Missing or invalid target_bank.")
             return "Please enter the name of the receiving bank."
             
-        if is_missing(params.get("target_account")):
+        if is_invalid_param(params.get("target_account"), "account"):
             st.session_state.awaiting_input_for = "target_account"
-            add_trace("⚠️ Validation", "Missing target_account.")
-            return "Please enter the target account number."
+            add_trace("⚠️ Validation", "Missing or invalid target_account.")
+            return "Please enter a valid target account number (must contain numbers)."
             
-        if is_missing(params.get("amount")):
+        if is_invalid_param(params.get("amount"), "text"):
             st.session_state.awaiting_input_for = "amount"
             add_trace("⚠️ Validation", "Missing amount.")
             return "Please enter the amount you wish to transfer."
 
+    # (이하 기존 분기 로직 동일)
     if decision == "NO_TRANSACTION":
         add_trace("🔄 Orchestrator", "Routed to Knowledge Tool")
         branch = params.get("branch", "")
