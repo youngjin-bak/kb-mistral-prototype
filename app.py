@@ -38,7 +38,7 @@ def api_unlock_card(card_id):
     return True
 
 def api_transfer(account_id, amount_str):
-    """상태(Balance)를 실제로 변경하는 결정론적 트랜잭션 함수"""
+    """Deterministic transaction function altering state"""
     clean_amt = str(amount_str).replace(",", "").replace("krw", "").strip()
     try:
         transfer_amount = int(clean_amt)
@@ -136,7 +136,7 @@ def classify_intent(user_message):
     # STAGE 2: MICRO-ROUTING & EXTRACTION (Cascading based on complexity)
     parameters = {}
     if intent == "TRANSFER":
-        # Complex task: Route to SMoE (Mixtral)
+        # Complex task: Route to SMoE (Mixtral 8x22b)
         smoe_prompt = f"""
         The user wants to execute a {intent}. 
         Extract 'target_bank', 'target_account', and 'amount'. If missing, omit the key. Do not use placeholders.
@@ -145,7 +145,10 @@ def classify_intent(user_message):
         """
         stage_2_result = _call_mistral_json("open-mixtral-8x22b", smoe_prompt, user_message, api_key)
         parameters = stage_2_result.get("parameters", {})
-        add_trace("🧠 Micro-Routing (SMoE: Mixtral 8x22b)", f"High-precision slot extraction: {parameters}")
+        
+        # Format for clean UI rendering
+        formatted_params = json.dumps(parameters, ensure_ascii=False)
+        add_trace("🧠 Micro-Routing (SMoE: Mixtral 8x22b)", f"High-precision slot extraction: {formatted_params}")
         
     elif intent == "FAQ":
         # Simple task: Keep on Mistral Small
@@ -157,6 +160,7 @@ def classify_intent(user_message):
         stage_2_result = _call_mistral_json("mistral-small-latest", faq_prompt, user_message, api_key)
         parameters = stage_2_result.get("parameters", {})
         
+        # Format for clean UI rendering
         formatted_params = json.dumps(parameters, ensure_ascii=False)
         add_trace("🤖 Extraction (Mistral Small)", f"Simple slot extraction: {formatted_params}")
 
@@ -168,17 +172,31 @@ def classify_intent(user_message):
 def handle_request(message):
     st.session_state.last_trace = [] 
     
-    if st.session_state.awaiting_input_for == "auth":
-# ... existing code ...
+    # Check if we are waiting for user input to fill a specific slot (Auth or Missing Params)
+    pending_slot = st.session_state.awaiting_input_for
+    if pending_slot == "auth":
+        if message.strip().lower() == st.session_state.auth_target_name.lower():
+            st.session_state.authenticated = True
+            st.session_state.awaiting_input_for = None
+            add_trace("🔐 Auth Engine", "Identity verified successfully.")
+            return process_active_intent()
+        else:
+            add_trace("🔐 Auth Engine", "Identity verification failed.")
+            return "Name does not match our records. Please enter your full name to verify your identity."
+            
+    elif pending_slot:
+        st.session_state.collected_params[pending_slot] = message
+        st.session_state.awaiting_input_for = None
+        add_trace("⚠️ Validation", f"User provided missing slot: {pending_slot}")
         return process_active_intent()
 
+    # If no pending slot, classify the new intent
     nlu_result = classify_intent(message)
     intent = nlu_result["intent"]
     
     if intent != "UNKNOWN":
         st.session_state.active_intent = intent
         st.session_state.collected_params = nlu_result["parameters"]
-        # The add_trace for Mistral NLU was moved into classify_intent to show the cascading steps.
     else:
         add_trace("🤖 Mistral NLU", "Failed to classify intent.")
         return "I couldn't understand your request. Please try again."
@@ -235,7 +253,7 @@ def process_active_intent():
         retrieved_info = retrieve_knowledge(branch, attribute)
         
         if retrieved_info:
-            return f"The {attribute} for {branch} branch is: {retrieved_info}"
+            return f"The {attribute} for the {branch} branch is: {retrieved_info}"
             
         st.session_state.pending_action = {
             "intent": "FAQ_MISSING_DATA",
