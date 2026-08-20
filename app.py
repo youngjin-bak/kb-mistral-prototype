@@ -105,7 +105,7 @@ def classify_intent(user_message):
         "response_format": {"type": "json_object"}
     }
     
-try:
+    try:
         req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
         with urllib.request.urlopen(req) as response:
             res_data = json.loads(response.read().decode('utf-8'))
@@ -126,7 +126,6 @@ try:
                 
             return {"intent": intent, "parameters": parameters}
     except Exception as e:
-        # 에러 발생 시 스트림릿 클라우드 로그에 원인 출력
         print(f"Mistral API Error: {e}")
         return {"intent": "UNKNOWN", "parameters": {}}
 
