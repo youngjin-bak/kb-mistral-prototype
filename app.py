@@ -1,7 +1,9 @@
 import streamlit as st
 import json
 import os
-import urllib.request
+
+from mistralai.client import MistralClient
+from mistralai.models.chat_completion import ChatMessage
 
 # ==========================================
 # 1. Mock State & Authentication Setup
@@ -29,8 +31,9 @@ def api_lock_card(card_id):
     return True
 
 # ==========================================
-# 3. Governance Layer (Policy Engine)
+# 3. Governance Layer (Policy Engine & Knowledge Base)
 # ==========================================
+
 def evaluate_policy(intent):
     if not st.session_state.authenticated:
         return "DENY"
@@ -38,34 +41,47 @@ def evaluate_policy(intent):
     policies = {
         "FAQ": "NO_TRANSACTION",
         "BALANCE": "READ_ONLY",
-        "CARD_LOCK": "HUMAN_APPROVAL_REQUIRED"
+        "CARD_LOCK": "HUMAN_APPROVAL_REQUIRED",
+        "TRANSFER": "HUMAN_APPROVAL_REQUIRED"
     }
     return policies.get(intent, "DENY")
 
-MOCK_KB = {
-    "FAQ": "KB branches are generally open from 9 AM to 4 PM, Monday to Friday."
-}
-# [여기를 수정/보완하세요] 
-# 새로운 지점 정보, 대출 금리 안내, 수수료 정책 등을 아래 딕셔너리에 추가합니다.
+
+# Nested Dictionary structure
 MOCK_KNOWLEDGE_BASE = {
-    "Gangnam": "Gangnam branch opens 0900-1600 during the weekdays (address: 123 Teheran-ro, Gangnam-gu, Seoul).",
-    "Jongro": "Jongro branch opens 0900-1630 during the weekdays (address: 45 Saejongdae-ro, Jongro-gu, Seoul).",
-    "Fee": "Transaction fee for other banks is 500KRW - VIP customers are exempt from fees."
+    "Gangnam": {
+        "hours": "9 AM to 4 PM, Mon-Fri",
+        "phone": "02-123-4567",
+        "loan_officer": "Youngjin Bak (loan_gangnam@kb.com)"
+    },
+    "Jongno": {
+        "hours": "9 AM to 4 PM, Mon-Fri",
+        "phone": "02-987-6543",
+        # loan_officer missing as intended
+    }
 }
 
-def retrieve_knowledge(user_message):
-    """결정론적 키워드 매칭을 통한 RAG 검색 모의 함수"""
-    for keyword, info in MOCK_KNOWLEDGE_BASE.items():
-        if keyword in user_message:
-            return info
-    return "KB 국민은행 영업점은 일반적으로 평일 오전 9시부터 오후 4시까지 운영됩니다."
+def retrieve_knowledge(branch, attribute):
+    """
+    지점(branch)과 속성(attribute)을 기반으로 정확한 값을 검색합니다.
+    데이터가 없으면 None을 반환하여 오케스트레이터가 인지하도록 합니다.
+    """
+    if not branch or not attribute:
+        return None
+    
+    branch_data = MOCK_KNOWLEDGE_BASE.get(branch)
+    if not branch_data:
+        return None
+        
+    return branch_data.get(attribute) # 값이 없으면 None 반환
+
 
 # ==========================================
 # 4. Probabilistic AI Layer (Mistral NLU)
 # ==========================================
 def classify_intent(user_message):
     api_key = os.environ.get("MISTRAL_API_KEY", "")
-    if not api_key: return "UNKNOWN"
+    if not api_key: return {"intent": "UNKNOWN", "parameters": {}}
         
     client = MistralClient(api_key=api_key)
     VALID_INTENTS = ["FAQ", "BALANCE", "CARD_LOCK", "TRANSFER", "UNKNOWN"]
@@ -76,11 +92,13 @@ def classify_intent(user_message):
             messages=[
                 ChatMessage(
                     role="system",
-                    # 추출할 파라미터의 스키마를 정의합니다.
+                    # [수정] FAQ일 경우 branch와 attribute를 추출하도록 스키마 강제
                     content="""
                     Classify the request into one category: FAQ, BALANCE, CARD_LOCK, TRANSFER, UNKNOWN.
-                    Extract relevant parameters if present.
-                    Return ONLY JSON: {"intent": "...", "parameters": {"target_account": "...", "amount": "..."}}
+                    If FAQ, extract 'branch' (e.g., Gangnam, Jongno) and 'attribute' (e.g., hours, phone, loan_officer).
+                    If TRANSFER, extract 'target_account' and 'amount'.
+                    Return ONLY valid JSON.
+                    Example: {"intent": "FAQ", "parameters": {"branch": "Gangnam", "attribute": "phone"}}
                     """
                 ),
                 ChatMessage(role="user", content=user_message)
@@ -98,31 +116,49 @@ def classify_intent(user_message):
         return {"intent": "UNKNOWN", "parameters": {}}
 
 # ==========================================
-# 5. Deterministic Orchestrator 
+# 5. Deterministic Orchestrator
 # ==========================================
 def handle_request(message):
     st.session_state.last_trace = [] 
     
-    # 1. NLU 결과(딕셔너리) 수신
+    # 1. NLU Extraction
     nlu_result = classify_intent(message)
     intent = nlu_result["intent"]
     parameters = nlu_result["parameters"]
     add_trace("🤖 Mistral NLU", f"Intent: {intent}, Params: {parameters}")
 
-    # (이전 evaluate_policy 호출 코드 유지) ...
-    decision = evaluate_policy(intent) # (TRANSFER 정책도 evaluate_policy에 추가 필요)
-    
-    # 특정 의도에 대한 필수 파라미터 누락 검증(Validation)
+    # 2. Policy Evaluation
+    decision = evaluate_policy(intent)
+    add_trace("⚖️ Policy Engine", f"Decision: {decision}")
+
+    # 3. Parameter Validation Loop
     if intent == "TRANSFER":
         if not parameters.get("target_account") or not parameters.get("amount"):
             add_trace("⚠️ Validation", "Missing parameters for TRANSFER")
-            return "Please input the receiving account number and amount."
+            return "To proceed with the transfer, please provide both the target account number and the amount."
 
+    # 4. Routing & Execution
     if decision == "NO_TRANSACTION":
         add_trace("🔄 Orchestrator", "Routed to Knowledge Tool")
-        # 앞서 만든 검색 함수 적용
-        return retrieve_knowledge(message)
         
+        branch = parameters.get("branch")
+        attribute = parameters.get("attribute")
+        retrieved_info = retrieve_knowledge(branch, attribute)
+        
+        # [추가] DB에 값이 존재할 경우 정상 반환
+        if retrieved_info:
+            add_trace("📚 Knowledge Tool", f"Found {attribute} for {branch}")
+            return f"The {attribute} for {branch} branch is: {retrieved_info}"
+        
+        # [추가] DB에 값이 없을 경우 상태 전환 (Human-in-the-loop)
+        st.session_state.pending_action = {
+            "intent": "FAQ_MISSING_DATA",
+            "branch": branch,
+            "attribute": attribute,
+            "status": "PENDING"
+        }
+        add_trace("⚠️ Orchestrator", f"Missing data for {branch} - {attribute}. Halted for Operator Input.")
+        return "I don't have that specific information in my database. Transferring to a human operator to provide the correct answer."
         
     elif decision == "READ_ONLY":
         add_trace("🔄 Orchestrator", "Routed to Banking Tool (Read)")
@@ -130,31 +166,34 @@ def handle_request(message):
         add_trace("🔧 Banking Tool", "Called api_get_balance()")
         return f"Your current balance is {balance:,} KRW."
         
-  elif decision == "HUMAN_APPROVAL_REQUIRED":
-        # Human Agent가 판단할 수 있도록 컨텍스트를 요약하여 주입합니다.
+    elif decision == "HUMAN_APPROVAL_REQUIRED":
+        # 5. Human-in-the-loop State Injection
         st.session_state.pending_action = {
             "intent": intent,
-            "action": "LOCK_CARD",
-            "internal_card_id": "CARD001",
-            "display_card": "****1234",
+            "action": "LOCK_CARD" if intent == "CARD_LOCK" else "TRANSFER",
+            "internal_id": "CARD001" if intent == "CARD_LOCK" else parameters.get("target_account"),
+            "display_target": "****1234" if intent == "CARD_LOCK" else parameters.get("target_account"),
             "status": "PENDING",
-            "human_summary": "Customer requested to lock their card.",
-            "verification_rule": "Customer identity verified (Auth: True)"
+            "human_summary": f"Customer requested a {intent} transaction.",
+            "verification_rule": "Device ownership verified (Auth: True)",
+            "amount": parameters.get("amount", "N/A")
         }
         add_trace("⏳ Orchestrator", "Halted workflow for Human Approval")
-        return "Human approval required - please check below."
+        return "Final approval from an authorized agent is required for security. Please review the details on the right."
         
     add_trace("🚫 Security", "Blocked by Default Deny")
     return "Request denied due to security policies."
 
 def execute_pending_action():
     action = st.session_state.pending_action
-    
     if action["action"] == "LOCK_CARD":
-        result = api_lock_card(action["internal_card_id"])
+        result = api_lock_card(action["internal_id"])
         if result:
             add_trace("⚙️ Banking API", f"Executed api_lock_card() -> {st.session_state.card_status}")
             return True
+    elif action["action"] == "TRANSFER":
+        add_trace("⚙️ Banking API", f"Executed api_transfer({action['internal_id']}, {action['amount']})")
+        return True
     return False
 
 # ==========================================
@@ -168,7 +207,7 @@ def main():
 
     with col_chat:
         st.subheader("Customer Chat")
-        st.caption("Supported Demo Queries: 'Branch hours', 'Account balance', 'Lock my card'")
+        st.caption("Demo: 'Gangnam branch info', 'Account balance', 'Transfer 50,000 KRW to account 123-456'")
         
         for msg in st.session_state.chat_history:
             st.chat_message(msg["role"]).write(msg["content"])
@@ -194,29 +233,48 @@ def main():
             for step in st.session_state.last_trace:
                 st.info(f"**{step['component']}** ➔ {step['detail']}")
 
-if st.session_state.pending_action and st.session_state.pending_action["status"] == "PENDING":
-            st.warning("⚠️ Human Approval Required")
+        if st.session_state.pending_action and st.session_state.pending_action["status"] == "PENDING":
             action = st.session_state.pending_action
             
-            # Human Agent에게 보여줄 데이터 렌더링 형태를 디자인합니다.
-            st.markdown("#### 📋 Transaction Summary")
-            st.write(f"**Summary:** {action.get('human_summary')}")
-            st.write(f"**Verfication:** {action.get('verification_rule')}")
-            st.write(f"**Target Card:** {action.get('display_card')}")
-            
-            
-            btn_col1, btn_col2 = st.columns(2)
-            if btn_col1.button("✅ Approve Transaction"):
-                add_trace("👤 Human Approval", "APPROVED")
-                execute_pending_action() 
-                st.session_state.pending_action["status"] = "EXECUTED"
-                st.success("Transaction Complete.")
-                st.rerun()
+            # [추가] 정보 누락(FAQ_MISSING_DATA)에 대한 오퍼레이터 입력 UI
+            if action.get("intent") == "FAQ_MISSING_DATA":
+                st.warning("⚠️ Operator Input Required (Missing Knowledge)")
+                st.write(f"**Requested Branch:** {action.get('branch')}")
+                st.write(f"**Requested Attribute:** {action.get('attribute')}")
                 
-            if btn_col2.button("❌ Reject"):
-                st.session_state.pending_action = None
-                st.error("Transaction cancelled.")
-                st.rerun()
+                # 오퍼레이터 수동 입력 폼
+                operator_response = st.text_input("Enter the answer to send to the customer:")
+                if st.button("📤 Send to Customer"):
+                    if operator_response:
+                        add_trace("👤 Operator", "Provided manual response")
+                        # 대화 기록에 오퍼레이터의 답변을 직접 추가
+                        st.session_state.chat_history.append({"role": "assistant", "content": f"[Operator] {operator_response}"})
+                        st.session_state.pending_action = None
+                        st.rerun()
+            
+            # (기존 트랜잭션 승인 UI 유지)
+            else:
+                st.warning("⚠️ Human Approval Required")
+                st.markdown("#### 📋 Transaction Summary")
+                st.write(f"**Summary:** {action.get('human_summary')}")
+                st.write(f"**Security Check:** {action.get('verification_rule')}")
+                st.write(f"**Target Identifier:** {action.get('display_target')}")
+                if action.get("amount") != "N/A":
+                    st.write(f"**Amount:** {action.get('amount')}")
+                
+                btn_col1, btn_col2 = st.columns(2)
+                if btn_col1.button("✅ Approve Transaction"):
+                    add_trace("👤 Human Approval", "APPROVED")
+                    execute_pending_action() 
+                    st.session_state.pending_action["status"] = "EXECUTED"
+                    st.success("Transaction Complete.")
+                    st.rerun()
+                    
+                if btn_col2.button("❌ Reject"):
+                    st.session_state.pending_action = None
+                    st.error("Transaction cancelled.")
+                    st.rerun()
+
 
 if __name__ == "__main__":
     init_state()
