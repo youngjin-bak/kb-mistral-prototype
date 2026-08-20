@@ -7,8 +7,14 @@ import urllib.request
 # 1. Mock State & Authentication Setup
 # ==========================================
 def init_state():
+    # Authentication & Session States added
     if "authenticated" not in st.session_state:
-        st.session_state.authenticated = True
+        st.session_state.authenticated = False
+        st.session_state.auth_target_name = "youngjin bak" 
+        st.session_state.active_intent = None
+        st.session_state.collected_params = {}
+        st.session_state.awaiting_input_for = None
+        
         st.session_state.balance = 1250000
         st.session_state.card_status = "ACTIVE"
         st.session_state.pending_action = None
@@ -28,22 +34,27 @@ def api_lock_card(card_id):
     st.session_state.card_status = "LOCKED"
     return True
 
+def api_unlock_card(card_id):
+    st.session_state.card_status = "ACTIVE"
+    return True
+
 # ==========================================
 # 3. Governance Layer (Policy Engine & Knowledge Base)
 # ==========================================
 def evaluate_policy(intent):
-    if not st.session_state.authenticated:
-        return "DENY"
+    # Enforce Authentication Boundary
+    if not st.session_state.authenticated and intent != "FAQ":
+        return "AUTH_REQUIRED"
 
     policies = {
         "FAQ": "NO_TRANSACTION",
         "BALANCE": "READ_ONLY",
         "CARD_LOCK": "HUMAN_APPROVAL_REQUIRED",
+        "CARD_UNLOCK": "HUMAN_APPROVAL_REQUIRED",
         "TRANSFER": "HUMAN_APPROVAL_REQUIRED"
     }
     return policies.get(intent, "DENY")
 
-# Nested Dictionary for multi-dimensional retrieval
 MOCK_KNOWLEDGE_BASE = {
     "Gangnam": {
         "hours": "9 AM to 4 PM, Mon-Fri",
@@ -53,22 +64,13 @@ MOCK_KNOWLEDGE_BASE = {
     "Jongno": {
         "hours": "9 AM to 4 PM, Mon-Fri",
         "phone": "02-987-6543"
-        # loan_officer is intentionally missing for Operator Input test
     }
 }
 
 def retrieve_knowledge(branch, attribute):
-    """Retrieves specific attributes. Returns None if data is missing."""
-    if not branch or not attribute:
-        return None
-    
-    # Simple capitalization normalization (e.g., 'gangnam' -> 'Gangnam')
-    branch = branch.capitalize()
-    
-    branch_data = MOCK_KNOWLEDGE_BASE.get(branch)
-    if not branch_data:
-        return None
-        
+    if not branch or not attribute: return None
+    branch_data = MOCK_KNOWLEDGE_BASE.get(branch.capitalize())
+    if not branch_data: return None
     return branch_data.get(attribute.lower())
 
 # ==========================================
@@ -91,11 +93,11 @@ def classify_intent(user_message):
             {
                 "role": "system",
                 "content": """
-                Classify the request into one category: FAQ, BALANCE, CARD_LOCK, TRANSFER, UNKNOWN.
-                If FAQ, extract 'branch' (e.g., Gangnam, Jongno) and 'attribute' (e.g., hours, phone, loan_officer).
+                Classify the request into one category: FAQ, BALANCE, CARD_LOCK, CARD_UNLOCK, TRANSFER, UNKNOWN.
+                If FAQ, extract 'branch' and 'attribute' (e.g., hours, phone, loan_officer).
                 If TRANSFER, extract 'target_account' and 'amount'.
                 Return ONLY valid JSON.
-                Example: {"intent": "FAQ", "parameters": {"branch": "Gangnam", "attribute": "phone"}}
+                Example: {"intent": "CARD_UNLOCK", "parameters": {}}
                 """
             },
             {"role": "user", "content": user_message}
@@ -112,88 +114,138 @@ def classify_intent(user_message):
             
             intent = result.get("intent", "UNKNOWN")
             parameters = result.get("parameters", {})
-            
-            VALID_INTENTS = ["FAQ", "BALANCE", "CARD_LOCK", "TRANSFER", "UNKNOWN"]
-            if intent not in VALID_INTENTS:
-                return {"intent": "UNKNOWN", "parameters": {}}
             return {"intent": intent, "parameters": parameters}
-    except Exception as e:
-        print(f"API Error: {e}")
+    except Exception:
         return {"intent": "UNKNOWN", "parameters": {}}
 
 # ==========================================
-# 5. Deterministic Orchestrator
+# 5. Deterministic Orchestrator (State Machine)
 # ==========================================
 def handle_request(message):
     st.session_state.last_trace = [] 
     
+    # 1. State Interception for Authentication
+    if st.session_state.awaiting_input_for == "auth":
+        if st.session_state.auth_target_name in message.lower():
+            st.session_state.authenticated = True
+            st.session_state.awaiting_input_for = None
+            add_trace("🔐 Auth Engine", "Identity verified successfully.")
+            return process_active_intent()
+        else:
+            add_trace("🔐 Auth Engine", f"Verification failed for input: {message}")
+            return "Authentication failed. Please enter your registered full name to proceed."
+
+    # 2. State Interception for Slot Filling (Missing Parameters)
+    if st.session_state.awaiting_input_for == "target_account":
+        st.session_state.collected_params["target_account"] = message
+        st.session_state.awaiting_input_for = None
+        add_trace("📥 Slot Filling", f"Captured Target Account: {message}")
+        return process_active_intent()
+
+    if st.session_state.awaiting_input_for == "amount":
+        st.session_state.collected_params["amount"] = message
+        st.session_state.awaiting_input_for = None
+        add_trace("📥 Slot Filling", f"Captured Amount: {message}")
+        return process_active_intent()
+
+    # 3. New Request Classification
     nlu_result = classify_intent(message)
     intent = nlu_result["intent"]
-    parameters = nlu_result["parameters"]
-    add_trace("🤖 Mistral NLU", f"Intent: {intent}, Params: {parameters}")
+    
+    if intent != "UNKNOWN":
+        st.session_state.active_intent = intent
+        st.session_state.collected_params = nlu_result["parameters"]
+        add_trace("🤖 Mistral NLU", f"Extracted Intent: {intent}")
+    else:
+        add_trace("🤖 Mistral NLU", "Failed to classify intent.")
+        return "I couldn't understand your request. Please try again."
 
+    return process_active_intent()
+
+def process_active_intent():
+    intent = st.session_state.active_intent
+    params = st.session_state.collected_params
+
+    # 1. Evaluate Policy (Checks Auth implicitly)
     decision = evaluate_policy(intent)
     add_trace("⚖️ Policy Engine", f"Decision: {decision}")
 
-    if intent == "TRANSFER":
-        if not parameters.get("target_account") or not parameters.get("amount"):
-            add_trace("⚠️ Validation", "Missing parameters for TRANSFER")
-            return "To proceed with the transfer, please provide both the target account number and the amount."
+    if decision == "AUTH_REQUIRED":
+        st.session_state.awaiting_input_for = "auth"
+        add_trace("🔐 Auth Engine", "Halted workflow. Requesting Identity Verification.")
+        return "For your security, please verify your identity by entering your full name."
 
+    # 2. Validate Required Parameters
+    if intent == "TRANSFER":
+        if not params.get("target_account"):
+            st.session_state.awaiting_input_for = "target_account"
+            add_trace("⚠️ Validation Engine", "Missing target_account. Prompting user.")
+            return "Please enter the target account number."
+        if not params.get("amount"):
+            st.session_state.awaiting_input_for = "amount"
+            add_trace("⚠️ Validation Engine", "Missing amount. Prompting user.")
+            return "Please enter the amount you wish to transfer."
+
+    # 3. Execute Validated Intent
     if decision == "NO_TRANSACTION":
         add_trace("🔄 Orchestrator", "Routed to Knowledge Tool")
-        
-        branch = parameters.get("branch", "")
-        attribute = parameters.get("attribute", "")
+        branch = params.get("branch", "")
+        attribute = params.get("attribute", "")
         retrieved_info = retrieve_knowledge(branch, attribute)
         
         if retrieved_info:
-            add_trace("📚 Knowledge Tool", f"Found {attribute} for {branch}")
             return f"The {attribute} for {branch} branch is: {retrieved_info}"
-        
-        # Missing Data Logic -> Route to Human Operator
+            
         st.session_state.pending_action = {
             "intent": "FAQ_MISSING_DATA",
             "branch": branch,
             "attribute": attribute,
             "status": "PENDING"
         }
-        add_trace("⚠️ Orchestrator", f"Missing data for {branch} - {attribute}. Halted for Operator Input.")
-        return "I don't have that specific information in my database. Transferring to a human operator to provide the correct answer."
+        return "I don't have that specific information. Transferring to a human operator."
         
     elif decision == "READ_ONLY":
-        add_trace("🔄 Orchestrator", "Routed to Banking Tool (Read)")
         balance = api_get_balance()
-        add_trace("🔧 Banking Tool", "Called api_get_balance()")
+        add_trace("🔧 Banking Tool", "Executed api_get_balance()")
         return f"Your current balance is {balance:,} KRW."
         
     elif decision == "HUMAN_APPROVAL_REQUIRED":
+        action_map = {
+            "CARD_LOCK": "LOCK_CARD",
+            "CARD_UNLOCK": "UNLOCK_CARD",
+            "TRANSFER": "TRANSFER"
+        }
+        
         st.session_state.pending_action = {
             "intent": intent,
-            "action": "LOCK_CARD" if intent == "CARD_LOCK" else "TRANSFER",
-            "internal_id": "CARD001" if intent == "CARD_LOCK" else parameters.get("target_account"),
-            "display_target": "****1234" if intent == "CARD_LOCK" else parameters.get("target_account"),
+            "action": action_map.get(intent),
+            "internal_id": "CARD001" if "CARD" in intent else params.get("target_account"),
+            "display_target": "****1234" if "CARD" in intent else params.get("target_account"),
             "status": "PENDING",
             "human_summary": f"Customer requested a {intent} transaction.",
-            "verification_rule": "Device ownership verified (Auth: True)",
-            "amount": parameters.get("amount", "N/A")
+            "verification_rule": f"Identity verified: {st.session_state.authenticated}",
+            "amount": params.get("amount", "N/A")
         }
         add_trace("⏳ Orchestrator", "Halted workflow for Human Approval")
-        return "Final approval from an authorized agent is required for security. Please review the details on the right."
-        
-    add_trace("🚫 Security", "Blocked by Default Deny")
-    return "Request denied due to security policies."
+        return "Final approval from an authorized agent is required. Please review the details."
 
 def execute_pending_action():
     action = st.session_state.pending_action
+    
     if action["action"] == "LOCK_CARD":
-        result = api_lock_card(action["internal_id"])
-        if result:
-            add_trace("⚙️ Banking API", f"Executed api_lock_card() -> {st.session_state.card_status}")
+        if api_lock_card(action["internal_id"]):
+            add_trace("⚙️ Banking API", "Executed api_lock_card()")
             return True
+            
+    elif action["action"] == "UNLOCK_CARD":
+        if api_unlock_card(action["internal_id"]):
+            add_trace("⚙️ Banking API", "Executed api_unlock_card()")
+            return True
+            
     elif action["action"] == "TRANSFER":
-        add_trace("⚙️ Banking API", f"Executed api_transfer({action['internal_id']}, {action['amount']})")
+        add_trace("⚙️ Banking API", f"Executed api_transfer to {action['internal_id']}")
         return True
+        
     return False
 
 # ==========================================
@@ -207,7 +259,6 @@ def main():
 
     with col_chat:
         st.subheader("Customer Chat")
-        st.caption("Try: 'Who is the loan officer at Jongno branch?' (Triggers Operator Input)")
         
         for msg in st.session_state.chat_history:
             st.chat_message(msg["role"]).write(msg["content"])
@@ -225,7 +276,12 @@ def main():
 
     with col_trace:
         st.subheader("System of Record")
-        st.write(f"**Balance:** {st.session_state.balance:,} KRW | **Card Status:** {st.session_state.card_status}")
+        auth_indicator = "✅ VERIFIED" if st.session_state.authenticated else "❌ UNVERIFIED"
+        
+        col_sys1, col_sys2, col_sys3 = st.columns(3)
+        col_sys1.write(f"**Auth:** {auth_indicator}")
+        col_sys2.write(f"**Balance:** {st.session_state.balance:,} KRW")
+        col_sys3.write(f"**Card:** {st.session_state.card_status}")
         st.divider()
         
         st.subheader("Execution Trace")
@@ -236,21 +292,18 @@ def main():
         if st.session_state.pending_action and st.session_state.pending_action["status"] == "PENDING":
             action = st.session_state.pending_action
             
-            # 1. Operator Input UI (Missing Knowledge)
             if action.get("intent") == "FAQ_MISSING_DATA":
-                st.warning("⚠️ Operator Input Required (Missing Knowledge)")
+                st.warning("⚠️ Operator Input Required")
                 st.write(f"**Requested Branch:** {action.get('branch')}")
                 st.write(f"**Requested Attribute:** {action.get('attribute')}")
                 
-                operator_response = st.text_input("Enter the answer to send to the customer:")
+                operator_response = st.text_input("Enter the answer to send:")
                 if st.button("📤 Send to Customer"):
                     if operator_response:
                         add_trace("👤 Operator", "Provided manual response")
                         st.session_state.chat_history.append({"role": "assistant", "content": f"[Operator] {operator_response}"})
                         st.session_state.pending_action = None
                         st.rerun()
-            
-            # 2. Human Approval UI (Transaction)
             else:
                 st.warning("⚠️ Human Approval Required")
                 st.markdown("#### 📋 Transaction Summary")
@@ -261,15 +314,19 @@ def main():
                     st.write(f"**Amount:** {action.get('amount')}")
                 
                 btn_col1, btn_col2 = st.columns(2)
-                if btn_col1.button("✅ Approve Transaction"):
+                if btn_col1.button("✅ Approve"):
                     add_trace("👤 Human Approval", "APPROVED")
                     execute_pending_action() 
                     st.session_state.pending_action["status"] = "EXECUTED"
+                    st.session_state.active_intent = None
+                    st.session_state.collected_params = {}
                     st.success("Transaction Complete.")
                     st.rerun()
                     
                 if btn_col2.button("❌ Reject"):
                     st.session_state.pending_action = None
+                    st.session_state.active_intent = None
+                    st.session_state.collected_params = {}
                     st.error("Transaction cancelled.")
                     st.rerun()
 
