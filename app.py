@@ -74,6 +74,7 @@ def retrieve_knowledge(branch, attribute):
 # ==========================================
 # 4. Probabilistic AI Layer (Mistral REST API)
 # ==========================================
+
 def classify_intent(user_message):
     api_key = os.environ.get("MISTRAL_API_KEY", "")
     if not api_key: return {"intent": "UNKNOWN", "parameters": {}}
@@ -92,10 +93,10 @@ def classify_intent(user_message):
                 "role": "system",
                 "content": """
                 Classify the request into one category: FAQ, BALANCE, CARD_LOCK, CARD_UNLOCK, TRANSFER, UNKNOWN.
-                If FAQ, extract 'branch' and 'attribute'.
+                If FAQ, extract 'branch' and 'attribute'. The 'attribute' MUST be 'hours', 'phone', or 'loan_officer'.
                 If TRANSFER, extract 'target_bank', 'target_account', and 'amount'.
+                CRITICAL INSTRUCTION: If a parameter is not explicitly provided by the user, omit the key entirely. DO NOT use placeholders like 'unknown', 'N/A', or null.
                 Return ONLY valid JSON.
-                Example: {"intent": "TRANSFER", "parameters": {"target_bank": "Shinhan", "target_account": "123-456", "amount": "50000"}}
                 """
             },
             {"role": "user", "content": user_message}
@@ -178,17 +179,25 @@ def process_active_intent():
         add_trace("🔐 Auth Engine", "Halted workflow. Requesting Identity Verification.")
         return "For your security, please verify your identity by entering your full name."
 
+    # Helper function to detect LLM hallucinations/placeholders
+    def is_missing(val):
+        if not val: return True
+        if str(val).strip().lower() in ["unknown", "n/a", "none", "null", ""]: return True
+        return False
+
     # Validate Required Parameters for TRANSFER (3-step sequence)
     if intent == "TRANSFER":
-        if not params.get("target_bank"):
+        if is_missing(params.get("target_bank")):
             st.session_state.awaiting_input_for = "target_bank"
             add_trace("⚠️ Validation", "Missing target_bank.")
             return "Please enter the name of the receiving bank."
-        if not params.get("target_account"):
+            
+        if is_missing(params.get("target_account")):
             st.session_state.awaiting_input_for = "target_account"
             add_trace("⚠️ Validation", "Missing target_account.")
             return "Please enter the target account number."
-        if not params.get("amount"):
+            
+        if is_missing(params.get("amount")):
             st.session_state.awaiting_input_for = "amount"
             add_trace("⚠️ Validation", "Missing amount.")
             return "Please enter the amount you wish to transfer."
