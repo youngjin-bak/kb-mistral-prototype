@@ -1,9 +1,7 @@
 import streamlit as st
 import json
 import os
-
-from mistralai.client import MistralClient
-from mistralai.models.chat_completion import ChatMessage
+import urllib.request
 
 # ==========================================
 # 1. Mock State & Authentication Setup
@@ -33,7 +31,6 @@ def api_lock_card(card_id):
 # ==========================================
 # 3. Governance Layer (Policy Engine & Knowledge Base)
 # ==========================================
-
 def evaluate_policy(intent):
     if not st.session_state.authenticated:
         return "DENY"
@@ -46,73 +43,82 @@ def evaluate_policy(intent):
     }
     return policies.get(intent, "DENY")
 
-
-# Nested Dictionary structure
+# Nested Dictionary for multi-dimensional retrieval
 MOCK_KNOWLEDGE_BASE = {
     "Gangnam": {
         "hours": "9 AM to 4 PM, Mon-Fri",
         "phone": "02-123-4567",
-        "loan_officer": "Youngjin Bak (loan_gangnam@kb.com)"
+        "loan_officer": "John Doe (john@kb.com)"
     },
     "Jongno": {
         "hours": "9 AM to 4 PM, Mon-Fri",
-        "phone": "02-987-6543",
-        # loan_officer missing as intended
+        "phone": "02-987-6543"
+        # loan_officer is intentionally missing for Operator Input test
     }
 }
 
 def retrieve_knowledge(branch, attribute):
-    """
-    지점(branch)과 속성(attribute)을 기반으로 정확한 값을 검색합니다.
-    데이터가 없으면 None을 반환하여 오케스트레이터가 인지하도록 합니다.
-    """
+    """Retrieves specific attributes. Returns None if data is missing."""
     if not branch or not attribute:
         return None
+    
+    # Simple capitalization normalization (e.g., 'gangnam' -> 'Gangnam')
+    branch = branch.capitalize()
     
     branch_data = MOCK_KNOWLEDGE_BASE.get(branch)
     if not branch_data:
         return None
         
-    return branch_data.get(attribute) # 값이 없으면 None 반환
-
+    return branch_data.get(attribute.lower())
 
 # ==========================================
-# 4. Probabilistic AI Layer (Mistral NLU)
+# 4. Probabilistic AI Layer (Mistral REST API)
 # ==========================================
 def classify_intent(user_message):
     api_key = os.environ.get("MISTRAL_API_KEY", "")
     if not api_key: return {"intent": "UNKNOWN", "parameters": {}}
         
-    client = MistralClient(api_key=api_key)
-    VALID_INTENTS = ["FAQ", "BALANCE", "CARD_LOCK", "TRANSFER", "UNKNOWN"]
+    url = "https://api.mistral.ai/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+    
+    payload = {
+        "model": "mistral-small-latest",
+        "messages": [
+            {
+                "role": "system",
+                "content": """
+                Classify the request into one category: FAQ, BALANCE, CARD_LOCK, TRANSFER, UNKNOWN.
+                If FAQ, extract 'branch' (e.g., Gangnam, Jongno) and 'attribute' (e.g., hours, phone, loan_officer).
+                If TRANSFER, extract 'target_account' and 'amount'.
+                Return ONLY valid JSON.
+                Example: {"intent": "FAQ", "parameters": {"branch": "Gangnam", "attribute": "phone"}}
+                """
+            },
+            {"role": "user", "content": user_message}
+        ],
+        "response_format": {"type": "json_object"}
+    }
     
     try:
-        response = client.chat(
-            model="mistral-small-latest",
-            messages=[
-                ChatMessage(
-                    role="system",
-                    # [수정] FAQ일 경우 branch와 attribute를 추출하도록 스키마 강제
-                    content="""
-                    Classify the request into one category: FAQ, BALANCE, CARD_LOCK, TRANSFER, UNKNOWN.
-                    If FAQ, extract 'branch' (e.g., Gangnam, Jongno) and 'attribute' (e.g., hours, phone, loan_officer).
-                    If TRANSFER, extract 'target_account' and 'amount'.
-                    Return ONLY valid JSON.
-                    Example: {"intent": "FAQ", "parameters": {"branch": "Gangnam", "attribute": "phone"}}
-                    """
-                ),
-                ChatMessage(role="user", content=user_message)
-            ],
-            response_format={"type": "json_object"}
-        )
-        result = json.loads(response.choices[0].message.content)
-        intent = result.get("intent", "UNKNOWN")
-        parameters = result.get("parameters", {})
-        
-        if intent not in VALID_INTENTS:
-            return {"intent": "UNKNOWN", "parameters": {}}
-        return {"intent": intent, "parameters": parameters}
-    except Exception:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+        with urllib.request.urlopen(req) as response:
+            res_data = json.loads(response.read().decode('utf-8'))
+            content = res_data['choices'][0]['message']['content']
+            result = json.loads(content)
+            
+            intent = result.get("intent", "UNKNOWN")
+            parameters = result.get("parameters", {})
+            
+            VALID_INTENTS = ["FAQ", "BALANCE", "CARD_LOCK", "TRANSFER", "UNKNOWN"]
+            if intent not in VALID_INTENTS:
+                return {"intent": "UNKNOWN", "parameters": {}}
+            return {"intent": intent, "parameters": parameters}
+    except Exception as e:
+        print(f"API Error: {e}")
         return {"intent": "UNKNOWN", "parameters": {}}
 
 # ==========================================
@@ -121,36 +127,31 @@ def classify_intent(user_message):
 def handle_request(message):
     st.session_state.last_trace = [] 
     
-    # 1. NLU Extraction
     nlu_result = classify_intent(message)
     intent = nlu_result["intent"]
     parameters = nlu_result["parameters"]
     add_trace("🤖 Mistral NLU", f"Intent: {intent}, Params: {parameters}")
 
-    # 2. Policy Evaluation
     decision = evaluate_policy(intent)
     add_trace("⚖️ Policy Engine", f"Decision: {decision}")
 
-    # 3. Parameter Validation Loop
     if intent == "TRANSFER":
         if not parameters.get("target_account") or not parameters.get("amount"):
             add_trace("⚠️ Validation", "Missing parameters for TRANSFER")
             return "To proceed with the transfer, please provide both the target account number and the amount."
 
-    # 4. Routing & Execution
     if decision == "NO_TRANSACTION":
         add_trace("🔄 Orchestrator", "Routed to Knowledge Tool")
         
-        branch = parameters.get("branch")
-        attribute = parameters.get("attribute")
+        branch = parameters.get("branch", "")
+        attribute = parameters.get("attribute", "")
         retrieved_info = retrieve_knowledge(branch, attribute)
         
-        # [추가] DB에 값이 존재할 경우 정상 반환
         if retrieved_info:
             add_trace("📚 Knowledge Tool", f"Found {attribute} for {branch}")
             return f"The {attribute} for {branch} branch is: {retrieved_info}"
         
-        # [추가] DB에 값이 없을 경우 상태 전환 (Human-in-the-loop)
+        # Missing Data Logic -> Route to Human Operator
         st.session_state.pending_action = {
             "intent": "FAQ_MISSING_DATA",
             "branch": branch,
@@ -167,7 +168,6 @@ def handle_request(message):
         return f"Your current balance is {balance:,} KRW."
         
     elif decision == "HUMAN_APPROVAL_REQUIRED":
-        # 5. Human-in-the-loop State Injection
         st.session_state.pending_action = {
             "intent": intent,
             "action": "LOCK_CARD" if intent == "CARD_LOCK" else "TRANSFER",
@@ -207,7 +207,7 @@ def main():
 
     with col_chat:
         st.subheader("Customer Chat")
-        st.caption("Demo: 'Gangnam branch info', 'Account balance', 'Transfer 50,000 KRW to account 123-456'")
+        st.caption("Try: 'Who is the loan officer at Jongno branch?' (Triggers Operator Input)")
         
         for msg in st.session_state.chat_history:
             st.chat_message(msg["role"]).write(msg["content"])
@@ -236,23 +236,21 @@ def main():
         if st.session_state.pending_action and st.session_state.pending_action["status"] == "PENDING":
             action = st.session_state.pending_action
             
-            # [추가] 정보 누락(FAQ_MISSING_DATA)에 대한 오퍼레이터 입력 UI
+            # 1. Operator Input UI (Missing Knowledge)
             if action.get("intent") == "FAQ_MISSING_DATA":
                 st.warning("⚠️ Operator Input Required (Missing Knowledge)")
                 st.write(f"**Requested Branch:** {action.get('branch')}")
                 st.write(f"**Requested Attribute:** {action.get('attribute')}")
                 
-                # 오퍼레이터 수동 입력 폼
                 operator_response = st.text_input("Enter the answer to send to the customer:")
                 if st.button("📤 Send to Customer"):
                     if operator_response:
                         add_trace("👤 Operator", "Provided manual response")
-                        # 대화 기록에 오퍼레이터의 답변을 직접 추가
                         st.session_state.chat_history.append({"role": "assistant", "content": f"[Operator] {operator_response}"})
                         st.session_state.pending_action = None
                         st.rerun()
             
-            # (기존 트랜잭션 승인 UI 유지)
+            # 2. Human Approval UI (Transaction)
             else:
                 st.warning("⚠️ Human Approval Required")
                 st.markdown("#### 📋 Transaction Summary")
@@ -274,7 +272,6 @@ def main():
                     st.session_state.pending_action = None
                     st.error("Transaction cancelled.")
                     st.rerun()
-
 
 if __name__ == "__main__":
     init_state()
